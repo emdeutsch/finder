@@ -2,7 +2,7 @@
 
 This lightweight Gradio interface lets users upload:
 1. A PDF outlining the customer's problem.
-2. A raw diagnostic data file (any text / log format).
+2. One or more raw diagnostic data files (any text / log format).
 
 It then invokes ``finder.diagnose_customer_issue`` and displays the LLM's
 analysis.  The UI is intentionally minimal and can be expanded later.
@@ -10,8 +10,9 @@ analysis.  The UI is intentionally minimal and can be expanded later.
 
 from __future__ import annotations
 
-import gradio as gr
 from pathlib import Path
+import tempfile
+import streamlit as st
 
 from finder import diagnose_customer_issue
 
@@ -22,8 +23,9 @@ from finder import diagnose_customer_issue
 
 
 def _run_diagnosis(
-    pdf_file: gr.File | None,
-    raw_files: list[gr.File] | None,
+    # (kept for backward-compat if called programmatically)
+    pdf_file: Path | None,
+    raw_files: list[Path] | None,
 ):
     """Run diagnosis and yield interim status for a better UX."""
     if pdf_file is None or not raw_files:
@@ -34,7 +36,9 @@ def _run_diagnosis(
     yield "⏳ Running diagnosis – this may take a minute..."
 
     pdf_path = Path(pdf_file.name)
-    raw_paths = [Path(f.name) for f in raw_files]
+    # Handle both temp file objects returned by Gradio (which have a `.name`)
+    # and plain string/Path file representations.
+    raw_paths = [Path(p.name) if hasattr(p, "name") else Path(p) for p in raw_files]
 
     try:
         # Provider is chosen via environment variable LLM_PROVIDER (or defaults)
@@ -45,26 +49,61 @@ def _run_diagnosis(
 
 
 # ---------------------------------------------------------------------------
-# UI launcher
+# Streamlit UI launcher (supports multi-file upload out of the box)
 # ---------------------------------------------------------------------------
 
 
-def launch(host: str = "127.0.0.1", port: int = 7861):
-    """Spin up the Gradio web UI."""
+def launch(host: str | None = None, port: int | None = None):  # noqa: D401 – keep signature stable
+    """Launch a minimal Streamlit app for interactive diagnosis.
 
-    with gr.Blocks(title="Customer Issue Diagnosis") as demo:
-        gr.Markdown("# Customer Issue Diagnosis")
+    Streamlit's ``st.file_uploader`` natively supports the ``accept_multiple_files``
+    flag, which avoids the single-file limitation we encountered with the previous
+    Gradio-based UI.  Running this script with ``streamlit run finder_ui.py`` will
+    start the web interface.  The *host* and *port* parameters are kept for
+    backward-compatibility but are unused because Streamlit manages those via CLI
+    flags (``--server.port`` etc.).
+    """
 
-        with gr.Row():
-            pdf_input = gr.File(label="Problem description (PDF)", file_types=[".pdf"])
-            raw_input = gr.Files(label="Raw diagnostic data files (txt/log/other)")
+    st.set_page_config(page_title="Customer Issue Diagnosis")
 
-        run_btn = gr.Button("Diagnose")
-        output_md = gr.Markdown()
+    st.title("Customer Issue Diagnosis")
 
-        run_btn.click(_run_diagnosis, inputs=[pdf_input, raw_input], outputs=output_md)
+    pdf_file = st.file_uploader(
+        "Problem description (PDF)",
+        type=["pdf"],
+        accept_multiple_files=False,
+    )
 
-    demo.queue().launch(server_name=host, server_port=port)
+    raw_files = st.file_uploader(
+        "Raw diagnostic data files (txt/log/other)",
+        type=["txt", "log", "csv", "json", "xml", "zip", "gz", "*"],
+        accept_multiple_files=True,
+    )
+
+    if st.button("Diagnose"):
+        if pdf_file is None or not raw_files:
+            st.warning("Please upload both the PDF and at least one raw data file.")
+            st.stop()
+
+        with st.spinner("⏳ Running diagnosis – this may take a minute..."):
+            tmp_dir = Path(tempfile.mkdtemp(prefix="finder_uploads_"))
+
+            # Save uploaded PDF
+            pdf_path = tmp_dir / pdf_file.name
+            pdf_path.write_bytes(pdf_file.getbuffer())
+
+            # Save raw files
+            raw_paths: list[Path] = []
+            for rf in raw_files:
+                raw_path = tmp_dir / rf.name
+                raw_path.write_bytes(rf.getbuffer())
+                raw_paths.append(raw_path)
+
+            try:
+                result = diagnose_customer_issue(pdf_path, raw_paths)
+                st.markdown(result)
+            except Exception as exc:
+                st.error(f"Error running diagnosis: {exc}")
 
 
 if __name__ == "__main__":

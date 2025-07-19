@@ -13,7 +13,10 @@ in a subsequent step.
 from __future__ import annotations
 
 import pathlib
-from typing import Literal, Sequence
+from typing import Literal, Sequence, cast, Any, TYPE_CHECKING
+
+import base64
+from io import BytesIO
 
 from llm import get_llm
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -66,6 +69,47 @@ def _extract_ocr_text(pdf_path: str | pathlib.Path) -> str:
             ocr_chunks.append(text.strip())
 
     return "\n\n".join(ocr_chunks)
+
+
+def _extract_pdf_page_images(pdf_path: str | pathlib.Path, *, max_pages: int | None = None) -> list[str]:
+    """Render each PDF page to a PNG data-URL string for Gemini vision models.
+
+    Parameters
+    ----------
+    pdf_path : str | pathlib.Path
+        Path to the PDF file.
+    max_pages : int | None, optional
+        Optional limit on the number of pages converted (to respect API payload limits).
+
+    Returns
+    -------
+    list[str]
+        A list of ``data:image/png;base64,...`` strings – one for each rendered page.
+    """
+    if convert_from_path is None:
+        # pdf2image missing → cannot extract page images.
+        return []
+
+    try:
+        images = convert_from_path(str(pdf_path), fmt="png", dpi=200)
+    except Exception:
+        return []
+
+    if max_pages is not None:
+        images = images[: max_pages]
+
+    data_urls: list[str] = []
+    for img in images:
+        buffer = BytesIO()
+        try:
+            img.save(buffer, format="PNG")
+            encoded = base64.b64encode(buffer.getvalue()).decode()
+            data_urls.append(f"data:image/png;base64,{encoded}")
+        except Exception:
+            # Skip problematic pages but continue processing others.
+            continue
+
+    return data_urls
 
 
 def _extract_pdf_text(pdf_path: str | pathlib.Path) -> str:
@@ -145,9 +189,12 @@ def diagnose_customer_issue(
             )
         raw_text = "\n\n".join(raw_parts)
     else:
-        raw_text = _read_raw_data(raw_data_path)
+        raw_text = _read_raw_data(cast(str | pathlib.Path, raw_data_path))
 
-    # Build LLM messages
+    # ------------------------------------------------------------------
+    # Build prompts – handle Gemini vision models specially so we can attach images
+    # ------------------------------------------------------------------
+
     system_prompt = (
         "You are a senior support engineer. A customer has provided a PDF describing "
         "their problem, as well as various hypotheses about what might be causing it. "
@@ -155,29 +202,71 @@ def diagnose_customer_issue(
     )
 
     user_prompt = (
-        "The PDF below outlines the customer's problem and lists several possible causes.\n\n"
-        "----- PDF START -----\n"
+        "The full plain-text extraction of the PDF appears below, followed by the rendered images for "
+        "each PDF page.  The images capture visual layout, graphics, logos, or any other information that "
+        "may be missing from the raw text.  Use BOTH the text and the images together to understand the "
+        "document in context.\n\n"
+        "----- PDF TEXT START -----\n"
         f"{pdf_text}\n"
-        "----- PDF END -----\n\n"
-        "Below is additional raw data that should allow you to pinpoint the precise cause.\n\n"
+        "----- PDF TEXT END -----\n\n"
+        "After the text you will find one image block per page, wrapped with the markers \"PDF PAGE N IMAGE START/END\".\n\n"
+        "The customer also supplied raw diagnostic data which appears after the images.\n\n"
         "----- RAW DATA START -----\n"
         f"{raw_text}\n"
         "----- RAW DATA END -----\n\n"
-        "Using ONLY the information above, please diagnose the customer's issue and thoroughly "
-        "explain why it is occurring. Provide a concise summary followed by a detailed technical analysis. "
-        "If the information is insufficient, state what additional data would be required."
+        "Using ONLY the information provided (text + images + raw data), diagnose the customer's issue. "
+        "Provide a concise summary, then a detailed technical analysis.  If the information is insufficient, "
+        "state what additional data would help."
     )
 
-    # ------------------------------------------------------------------
-    # Invoke LLM
-    # ------------------------------------------------------------------
-
     llm = get_llm(provider=provider)
-    messages = [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
 
-    # Print full prompt for debugging purposes
-    print("\n===== LLM PROMPT (SYSTEM) =====\n", system_prompt, sep="")
-    print("\n===== LLM PROMPT (USER) =====\n", user_prompt, sep="")
+    # Detect whether the selected LLM backend is Gemini *and* supports images.
+    # We check either an explicit provider flag or the instantiated class name.
+    if TYPE_CHECKING:
+        # Only for static type checking – avoid runtime dependency if package missing.
+        from langchain_google_genai import ChatGoogleGenerativeAI  # type: ignore  # pragma: no cover
+
+    # Use string comparison to avoid hard import of ChatGoogleGenerativeAI for runtime.
+    using_gemini_vision = False
+    if (provider or "").lower() == "gemini_api":
+        using_gemini_vision = True
+    else:
+        # Check class name to detect Gemini model without importing module.
+        if llm.__class__.__name__ == "ChatGoogleGenerativeAI":
+            using_gemini_vision = True
+
+    # Prepare placeholder for messages to avoid redefinition issues with static type checkers.
+    messages: list[Any]
+
+    # Gemini vision models require a *single* HumanMessage and support images.
+    if using_gemini_vision:
+        # Combine system + user text, then append images with page context.
+        combined_text = f"{system_prompt}\n\n{user_prompt}"
+
+        content_parts: list[Any] = [{"type": "text", "text": combined_text}]
+
+        # Attach page images – limit to 16 to respect Gemini payload limits.
+        page_images = _extract_pdf_page_images(pdf_path, max_pages=16)
+        for idx, data_url in enumerate(page_images, start=1):
+            # Provide clear delimiters so the model knows the source page.
+            content_parts.append({"type": "text", "text": f"----- PDF PAGE {idx} IMAGE START -----"})
+            content_parts.append({"type": "image_url", "image_url": data_url})
+            content_parts.append({"type": "text", "text": f"----- PDF PAGE {idx} IMAGE END -----"})
+
+        # Cast to satisfy strict typing – runtime will accept the structure.
+        messages = [HumanMessage(content=content_parts)]  # type: ignore[arg-type]
+
+        # Debug logging – show page markers so users see where images go.
+        print("\n===== LLM PROMPT (COMBINED TEXT + IMAGE MARKERS) =====\n", combined_text, sep="")
+        print(f"\n[LLM] Attached {len(page_images)} page image(s). Markers are included in the prompt after the text block.")
+    else:
+        # Original two-message flow for providers that do not support image input.
+        messages = [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]  # type: ignore[arg-type]
+
+        # Print full prompt for debugging purposes
+        print("\n===== LLM PROMPT (SYSTEM) =====\n", system_prompt, sep="")
+        print("\n===== LLM PROMPT (USER) =====\n", user_prompt, sep="")
 
     response = llm.invoke(messages)  # type: ignore[arg-type]
 
